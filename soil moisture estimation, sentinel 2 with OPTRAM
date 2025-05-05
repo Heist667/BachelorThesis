@@ -1,0 +1,116 @@
+var geometry = 
+    /* color: #ffc82d */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[7.360028923993136, 52.314685054534635],
+          [7.360028923993136, 52.25167580380203],
+          [7.538556756024386, 52.25167580380203],
+          [7.538556756024386, 52.314685054534635]]], null, false),
+    imageCollection = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED");
+
+// choosing Sentinel-2, Level-2A; for atmospherical correction
+Map.centerObject(geometry); // definition of the region of interest
+
+var sentinel = imageCollection
+.filterBounds(geometry)
+.filterDate('2023','2025')
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 56));
+
+function temporal_collection(collection, start, count, interval, unit){ // creating multitemporal collection, supported by google developers
+  var seq = ee.List.sequence(0, ee.Number(count).subtract(1));          // creating a list for the output images 
+  var origin_date = ee.Date(start);                                     // helps to convert the string value for a start converted to the date format
+  return ee.ImageCollection(seq.map(function(i){                        
+    var start_date = origin_date.advance(ee.Number(interval).multiply(ee.Number(i)), unit);      
+    var end_date = origin_date.advance(ee.Number(interval).multiply(ee.Number(i).add(1)), unit);
+    return collection.filterDate(start_date, end_date).median()
+    .set('system:time_start', start_date.millis())
+    .set('system:time_end', end_date.millis())
+    }))
+  }
+  
+var monthly = temporal_collection(sentinel, '2023', 24, 1, 'month'); // definition of the parameters start, length = month, time difference of one day and title is 'month'
+                                                                    // man kann das zweimal durchführen, für 2023 und 2024
+print(monthly)
+
+var parameters = monthly.map(function(img){
+  var bands = img.select('B.*').multiply(0.0001); // all bands with 'B' selected
+  var ndvi = bands.normalizedDifference(['B8','B4']).rename('ndvi');
+  var str = bands.expression('((1 - swir) ** 2)/(2 * swir)',{'swir': bands.select('B12')}).rename('str');
+  var stack = ee.Image.cat([ndvi, str]);
+  return stack
+  .copyProperties(img, img.propertyNames())
+  });
+  
+var str_full_cover = parameters.map(function(img){
+  var thr_full = img.select('ndvi').gt(0.3); // showing the full cover regions
+  var str_full = img.select('str').updateMask(thr_full);
+  return str_full
+  .copyProperties(img, img.propertyNames())
+  });
+
+var str_bareland = parameters.map(function(img){
+  var thr_bare = img.select('ndvi').gt(0).and(img.select('ndvi').lt(0.2))
+  var str_bare = img.select('str').updateMask(thr_bare)
+  return str_bare
+  .copyProperties(img, img.propertyNames())
+  })
+  
+  
+var vw = ee.Number(str_full_cover.max().reduceRegion({
+  reducer: ee.Reducer.max(), geometry: geometry, scale: 100
+  }).values().get(0));
+  
+var vd = ee.Number(str_full_cover.min().reduceRegion({
+  reducer: ee.Reducer.min(), geometry: geometry, scale: 100
+  }).values().get(0));
+  
+var iw = ee.Number(str_full_cover.max().reduceRegion({
+  reducer: ee.Reducer.max(), geometry: geometry, scale: 100
+  }).values().get(0));
+  
+var id = ee.Number(str_full_cover.min().reduceRegion({
+  reducer: ee.Reducer.min(), geometry: geometry, scale: 100
+  }).values().get(0));
+  
+
+var sw = vw.subtract(iw);
+var sd = vd.subtract(id);
+
+var sm = parameters.map(function(img){
+  var mask = img.select('ndvi').lt(-0.1).not()
+  var index = img.expression('(id + sd * ndvi - str) / (id - iw + (sd - sw) * ndvi)',
+  {'id': id, 'sd': sd, 'ndvi': img.select('ndvi'), 'str': img.select('str'), 'iw': iw, 'sw': sw})
+  .rename('soil_moisture');
+  return index.multiply(1000).updateMask(mask)
+  .copyProperties(img, img.propertyNames())
+  })
+
+print(
+  ui.Chart.image.series(sm, geometry, ee.Reducer.first(), 20, 'system:time_start')
+  )
+
+Map.addLayer(sm.toBands().clip(geometry),[],'sm',false);
+
+var mask = parameters.select('ndvi')
+
+Export.image.toDrive({
+  image:sm.toBands().clip(geometry),
+  description: 'sen_sm',
+  scale: 20,
+  region: geometry,
+  maxPixels: 1e13,
+  crs: sm.toBands().getInfo().crs,
+  folder: 'sentinel2'
+  })
+
+/*Cloud-Masking: Nutze zusätzlich die Scene Classification Map (SCL), um Wolken und Schatten gezielter zu maskieren.
+
+Cloud Probability: Falls verfügbar, verwende die Cloud Probability Bänder (MSK_CLDPRB) für eine bessere Cloud-Maskierung.
+
+Parallelisierung: Bei großen Regionen oder vielen Monaten kann es sinnvoll sein, die Berechnung in Batches aufzuteilen.
+*/
