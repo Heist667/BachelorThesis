@@ -1,0 +1,29 @@
+var geometry = 
+    /* color: #d63000 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[7.379725307345084, 52.31173487029878],
+          [7.379725307345084, 52.19719395437755],
+          [7.568896144747428, 52.19719395437755],
+          [7.568896144747428, 52.31173487029878]]], null, false),
+    table = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level0");
+
+var geometry = 
+    /* color: #d63000 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[7.379725307345084, 52.31173487029878],
+          [7.379725307345084, 52.19719395437755],
+          [7.568896144747428, 52.19719395437755],
+          [7.568896144747428, 52.31173487029878]]], null, false),
+    table = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level0");
