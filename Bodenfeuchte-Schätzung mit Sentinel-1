@@ -1,0 +1,196 @@
+var geometry = 
+    /* color: #d63000 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[7.379725307345084, 52.31173487029878],
+          [7.379725307345084, 52.19719395437755],
+          [7.568896144747428, 52.19719395437755],
+          [7.568896144747428, 52.31173487029878]]], null, false),
+    imageCollection = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    imageCollection2 = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1");
+
+// === Imports and Initialization ===
+// ===================================
+
+// Center map on the Region of Interest (geometry must be imported/defined)
+Map.centerObject(geometry);
+
+// Load Sentinel-1 ImageCollection
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD');
+
+// Load Dynamic World V1 ImageCollection (land cover)
+var dynamicWorld = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1');
+
+// Define time interval
+var time_start = ee.Date('2023-10-01');
+var time_end = ee.Date('2024-02-29');
+var time_dif = time_end.difference(time_start, 'day');
+print('Days in interval:', time_dif);
+
+// === Sentinel-1 Filtering & Separation ===
+// =========================================
+
+// Filter Sentinel-1 for VV polarization, IW mode, and within AOI
+var sen1 = sentinel1
+  .filterDate(time_start, time_end)
+  .filterBounds(geometry)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VV'))
+  .filter(ee.Filter.eq('instrumentMode','IW'))
+  .select('VV');
+
+// Print available orbits (ASCENDING/DESCENDING)
+print('Available orbits:', sen1.aggregate_array('orbitProperties_pass').distinct());
+
+// Separate by orbit direction
+var asc = sen1.filter(ee.Filter.eq('orbitProperties_pass','ASCENDING'));
+var des = sen1.filter(ee.Filter.eq('orbitProperties_pass','DESCENDING'));
+
+// === 10-Day Composites as Function ===
+// =====================================
+
+// Generate list of start dates for 10-day intervals
+var list_dates = ee.List.sequence(0, time_dif.subtract(1), 10)
+  .map(function(interval){
+    return time_start.advance(interval, 'day');
+  });
+
+// Function to create 10-day composites (mean)
+function tenDayComposite(collection) {
+  return ee.ImageCollection(list_dates.map(function(dates){
+    var start_date = ee.Date(dates);
+    var end_date = start_date.advance(10, 'day');
+    var composite = collection.filterDate(start_date, end_date).mean();
+    var bands = composite.bandNames().size();
+    return composite
+      .set('system:time_start', start_date.millis())
+      .set('system:time_end', end_date.millis())
+      .set('band_number', bands);
+  })).filter(ee.Filter.eq('band_number', 1)); // Keep only composites with data
+}
+
+// Calculate 10-day composites for both orbit directions
+var asc_10days = tenDayComposite(asc);
+var des_10days = tenDayComposite(des);
+
+// === Speckle Filtering (radius as variable) ===
+// ==============================================
+
+// Radius for speckle filtering (in meters)
+var speckle_radius = 30;
+
+// Function: Convert to Sigma0 and apply speckle filter
+function toSigma(image) {
+  var sigma = ee.Image(10).pow(image.divide(10)).rename('sigma');
+  var speckle = sigma.focalMean(speckle_radius, 'square', 'meters');
+  return speckle.copyProperties(image, image.propertyNames());
+}
+
+// Apply speckle filter to composites
+var asc_sigma = asc_10days.map(toSigma);
+var des_sigma = des_10days.map(toSigma);
+
+// === Mask Creation (Water & Urban combined) ===
+// ==============================================
+
+// Calculate mode of land cover from Dynamic World for time period and AOI
+var landcover_mode = dynamicWorld
+  .filterDate(time_start, time_end)
+  .filterBounds(geometry)
+  .select('label')
+  .mode();
+
+// Create mask for water (0 = water) and urban (6 = urban) inverted
+var water_mask = landcover_mode.neq(0); // everything except water
+var urban_mask = landcover_mode.neq(6); // everything except urban
+var mask = water_mask.and(urban_mask);  // only non-water and non-urban
+
+// === RFE Calculation (Relative Moisture Excess) ===
+// =================================================
+
+// Calculate minimum and maximum of time series (per pixel)
+var asc_min = asc_sigma.min();
+var asc_max = asc_sigma.max();
+var des_min = des_sigma.min();
+var des_max = des_sigma.max();
+
+// Function to calculate the RFE index
+function calcRFE(img, min, max, mask, name) {
+  var denominator = max.subtract(min);
+  denominator = denominator.where(denominator.eq(0), 1); // Prevent division by zero
+  var rfe = img.subtract(min).divide(denominator);
+  var date = img.date().format('YYYY-MM-dd');
+  return rfe.multiply(mask).rename(name)
+    .copyProperties(img, ['system:time_start'])
+    .set('date', ee.String(date));
+}
+
+// Calculate RFE for all composites (both orbit directions)
+var asc_rfe = asc_sigma.map(function(img){
+  return calcRFE(img, asc_min, asc_max, mask, 'rfe_asc');
+});
+var des_rfe = des_sigma.map(function(img){
+  return calcRFE(img, des_min, des_max, mask, 'rfe_des');
+});
+
+// === Visualization & Charts ===
+// ==============================
+
+// Add RFE time series as layer on the map (clipped to AOI)
+Map.addLayer(
+  asc_rfe.filterDate('2023-10-01','2024-02-29').toBands().clip(geometry),
+  {},
+  'RFE Ascending',
+  false
+);
+
+Map.addLayer(
+  des_rfe.filterDate('2023-10-01','2024-02-29').toBands().clip(geometry),
+  {},
+  'RFE Descending',
+  false
+);
+
+// Print RFE time series object
+print('RFE Ascending:', asc_rfe);
+
+// Time series as chart (mean over AOI per timestamp)
+print(
+  ui.Chart.image.series(asc_rfe, geometry, ee.Reducer.mean(), 100, 'system:time_start')
+    .setOptions({title: 'RFE (Ascending)', vAxis: {title: 'RFE Index'}})
+);
+
+print(
+  ui.Chart.image.series(des_rfe, geometry, ee.Reducer.mean(), 100, 'system:time_start')
+    .setOptions({title: 'RFE (Descending)', vAxis: {title: 'RFE Index'}})
+);
+
+// Print number of composites
+print('Ascending count:', asc_10days.size());
+print('Descending count:', des_10days.size());
+
+// Calculate and print scene count per composite
+asc_10days.map(function(img) {
+  var start = ee.Date(img.get('system:time_start'));
+  var end = ee.Date(img.get('system:time_end'));
+  var count = asc.filterDate(start, end).size();
+  return img.set('scene_count', count);
+}).aggregate_array('scene_count').evaluate(print);
+
+// === Export ===
+// ==============
+
+// Export stacked RFE bands for descending orbit as GeoTIFF
+Export.image.toDrive({
+  image: des_rfe.filterDate('2023-10-01','2024-02-29').toBands().clip(geometry),
+  description: 'RFE_Descending_2023-10_to_2024-02',
+  scale: 100,
+  region: geometry,
+  crs: 'EPSG:4326',
+  folder: 'test',
+  maxPixels: 1e13
+});
