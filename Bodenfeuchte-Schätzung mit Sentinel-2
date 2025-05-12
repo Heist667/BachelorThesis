@@ -1,0 +1,222 @@
+var geometry = 
+    /* color: #d63000 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[7.379725307345084, 52.31173487029878],
+          [7.379725307345084, 52.19719395437755],
+          [7.568896144747428, 52.19719395437755],
+          [7.568896144747428, 52.31173487029878]]], null, false),
+    imageCollection = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED");
+
+// === IMPORTS ===
+var scaleAnalysis = 20; // scale in meters for analysis and export
+var starDate = '2023-01-01';
+var endDate = '2024-01-01'; // change to '2024-01-01' and '2025-01-01' when running the code the second time 
+
+// Sentinel-2 Level-2A ImageCollection import
+var imageCollection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+
+// === SENTINEL-2 FILTERING & TIME SERIES ===
+Map.centerObject(geometry); // Center map on the region of interest
+
+// Filter Sentinel-2 by AOI, date, and cloud cover
+var sentinel = imageCollection
+  .filterBounds(geometry)
+  .filterDate(starDate, endDate)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 56));
+
+// Function to generate a temporal (monthly) collection
+function temporal_collection(collection, start, count, interval, unit) {
+  var seq = ee.List.sequence(0, ee.Number(count).subtract(1));
+  var origin_date = ee.Date(start);
+  return ee.ImageCollection(seq.map(function(i) {
+    var start_date = origin_date.advance(ee.Number(interval).multiply(ee.Number(i)), unit);
+    var end_date = origin_date.advance(ee.Number(interval).multiply(ee.Number(i).add(1)), unit);
+    return collection.filterDate(start_date, end_date).median()
+      .set('system:time_start', start_date.millis())
+      .set('system:time_end', end_date.millis());
+  }));
+}
+
+// Create monthly median composites for 2023
+var monthly = temporal_collection(sentinel, '2023-01-01', 12, 1, 'month'); // change to '2024-01-01' when running the code the second time 
+print('Monthly collection:', monthly);
+
+// === INDEX CALCULATION ===
+// Calculate NDVI and STR indices for each monthly image
+var parameters = monthly.map(function(img){
+  var bands = img.select('B.*').multiply(0.0001);
+  var ndvi = bands.normalizedDifference(['B8','B4']).rename('ndvi');
+  var str = bands.expression('((1 - swir) ** 2)/(2 * swir)', {'swir': bands.select('B12')}).rename('str');
+  return ee.Image.cat([ndvi, str]).copyProperties(img, img.propertyNames());
+});
+
+// === NDVI MASKING ===
+// Mask STR for full cover (NDVI > 0.3)
+var str_full_cover = parameters.map(function(img){
+  var thr_full = img.select('ndvi').gt(0.3);
+  return img.select('str').updateMask(thr_full).copyProperties(img, img.propertyNames());
+});
+
+// Mask STR for bare land (0 < NDVI < 0.2)
+var str_bareland = parameters.map(function(img){
+  var thr_bare = img.select('ndvi').gt(0).and(img.select('ndvi').lt(0.2));
+  return img.select('str').updateMask(thr_bare).copyProperties(img, img.propertyNames());
+});
+
+// === SOIL MOISTURE STATISTICS ===
+// Helper function to get statistics from an image collection
+function getStat(collection, reducer, scale) {
+  var reduced = collection.reduce(ee.Reducer[reducer]());
+  var values = reduced.reduceRegion({
+    reducer: ee.Reducer[reducer](),
+    geometry: geometry,
+    scale: scale,
+    bestEffort: true,
+    maxPixels: 1e7
+  }).values();
+  return ee.Number(values.get(0));
+}
+
+// Calculate statistics for soil moisture normalization
+var vw = getStat(str_full_cover, 'max', 100);
+var vd = getStat(str_full_cover, 'min', 100);
+var iw = getStat(str_full_cover, 'max', 100);
+var id = getStat(str_full_cover, 'min', 100);
+
+var sw = vw.subtract(iw);
+var sd = vd.subtract(id);
+
+// Calculate soil moisture index for each monthly image
+var sm = parameters.map(function(img){
+  var mask = img.select('ndvi').lt(-0.1).not();
+  var index = img.expression(
+    '(id + sd * ndvi - str) / (id - iw + (sd - sw) * ndvi)',
+    {'id': id, 'sd': sd, 'ndvi': img.select('ndvi'), 'str': img.select('str'), 'iw': iw, 'sw': sw}
+  ).rename('soil_moisture');
+  return index.multiply(1000).updateMask(mask)
+    .copyProperties(img, img.propertyNames());
+});
+
+// Print soil moisture time series chart
+print(ui.Chart.image.series(sm, geometry, ee.Reducer.first(), 20, 'system:time_start'));
+
+// Add soil moisture stack as map layer
+Map.addLayer(sm.toBands().clip(geometry), {}, 'Soil Moisture', false);
+
+// === SENTINEL-2 MEAN IMAGE FOR FEATURE STACK ===
+// Create a mean composite for the whole period for classification
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(geometry)
+  .filterDate(starDate, endDate)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 15))
+  .mean()
+  .clip(geometry)
+  .select("B.*").multiply(0.0001)
+  .reproject('EPSG:4326', null, scaleAnalysis);
+
+// Add mean composite as map layer
+Map.addLayer(
+  s2,
+  {bands: ["B8A","B4","B3"], gamma: 1, max: 0.500, min: 0.012, opacity: 1},
+  "Sentinel-2 Imagery",
+  false
+);
+
+// === REFERENCE DATA ===
+// Load ESA WorldCover V2 as reference (class band)
+var refData = ee.ImageCollection('ESA/WorldCover/v200')
+  .first()
+  .reproject('EPSG:4326', null, scaleAnalysis)
+  .clip(geometry)
+  .select('Map');
+
+Map.addLayer(refData, {bands: ['Map']}, "ESA WorldCover V2", false);
+
+// === FEATURE STACK ===
+// Combine features for classification (Sentinel-2 + WorldCover)
+var data = ee.Image.cat(s2, refData);
+
+// === SAMPLING ===
+// Stratified sampling for classification (200 points per class)
+var samples = data.select(data.bandNames()).stratifiedSample({
+  numPoints: 200,
+  classBand: 'Map',
+  region: geometry,
+  scale: scaleAnalysis,
+  geometries: true
+});
+print("Sample detail:", samples);
+
+// === TRAIN/VALIDATION SPLIT ===
+// Split samples into training and validation sets
+var withRandom = samples.randomColumn('random');
+var split = 0.7;
+var training = withRandom.filter(ee.Filter.lt('random', split));
+var validation = withRandom.filter(ee.Filter.gte('random', split));
+
+Map.addLayer(samples, {color: 'red'}, "All Samples");
+
+// === RANDOM FOREST RFE ===
+// Recursive Feature Elimination with Random Forest
+var classifier = ee.Classifier.smileRandomForest(10);
+var bandNames = data.bandNames().remove('Map');
+
+var trainAccuracies = [];
+var valAccuracies = [];
+var variableImportance = [];
+
+// Function for one RFE iteration
+function iterativeClassification(currentBandNames) {
+  var trained = classifier.train(training, 'Map', currentBandNames);
+  var trainAccuracy = trained.confusionMatrix().accuracy();
+  var validated = validation.classify(trained);
+  var valAccuracy = validated.errorMatrix('Map', 'classification').accuracy();
+  trainAccuracies.push(trainAccuracy.getInfo());
+  valAccuracies.push(valAccuracy.getInfo());
+  var dict = trained.explain();
+  var variable_importance = ee.Dictionary(dict.get('importance'));
+  variableImportance.push(variable_importance.getInfo());
+  var keysList = variable_importance.keys();
+  var valuesList = variable_importance.values();
+  var minIndex = valuesList.indexOf(valuesList.reduce(ee.Reducer.min()));
+  var leastImportantBand = keysList.get(minIndex);
+  return currentBandNames.remove(leastImportantBand);
+}
+
+// RFE loop: Remove least important band each iteration
+while (bandNames.length().getInfo() > 1) {
+  bandNames = iterativeClassification(bandNames);
+}
+
+// === ACCURACY-CHART ===
+// Prepare data for accuracy chart
+var xValues = [];
+for (var i = trainAccuracies.length; i >= 2; i--) {
+  xValues.push(i);
+}
+var features = xValues.map(function(x, i) {
+  return ee.Feature(null, {
+    'nFeatures': x,
+    'training': trainAccuracies[i],
+    'validation': valAccuracies[i]
+  });
+});
+var collection = ee.FeatureCollection(features);
+
+// Create and print accuracy chart (training vs. validation)
+var chart = ui.Chart.feature.byFeature(collection, 'nFeatures')
+  .setSeriesNames(['Training Accuracy', 'Validation Accuracy'])
+  .setOptions({
+    title: 'Training and Validation Accuracies',
+    hAxis: {'title': 'nFeatures'},
+    vAxis: {'title': 'Accuracy'},
+    lineWidth: 1,
+    colors: ['red', 'green']
+  });
+print(chart);
