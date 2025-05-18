@@ -1,0 +1,182 @@
+var geometry = 
+    /* color: #d63000 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[7.379725307345084, 52.31173487029878],
+          [7.379725307345084, 52.19719395437755],
+          [7.568896144747428, 52.19719395437755],
+          [7.568896144747428, 52.31173487029878]]], null, false);
+
+// === Imports and Initialization ===
+// ===================================
+
+// Region of Interest (polygon must be imported)
+Map.centerObject(geometry); // Center the map on the study area
+
+// Load Sentinel-1 ImageCollection
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD'); // Load Sentinel-1 SAR data (GRD products)
+
+// Load Dynamic World V1 ImageCollection
+var dynamicWorld = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1'); // Load land cover dataset at 10m resolution
+
+// Define time interval
+var time_start = ee.Date('2023-10-01'); // Start date
+var time_end = ee.Date('2024-02-29');   // End date
+var time_dif = time_end.difference(time_start, 'day'); // Calculate time span in days
+print('Days in interval:', time_dif);
+
+// === Sentinel-1 Filtering & Separation ===
+// =========================================
+
+// Filter Sentinel-1 by date, area, polarization, and mode
+var sen1 = sentinel1
+  .filterDate(time_start, time_end) // Filter by time interval
+  .filterBounds(geometry)           // Filter by area
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VV')) // Only VV polarization
+  .filter(ee.Filter.eq('instrumentMode','IW')) // Only IW mode (Interferometric Wide Swath)
+  .select('VV'); // Select only VV band
+
+print('Available orbits:', sen1.aggregate_array('orbitProperties_pass').distinct()); // Show available orbit directions
+
+var asc = sen1.filter(ee.Filter.eq('orbitProperties_pass','ASCENDING'));   // Ascending orbits
+var des = sen1.filter(ee.Filter.eq('orbitProperties_pass','DESCENDING'));  // Descending orbits
+
+// === 10-Day Composites as Function ===
+// =====================================
+
+// Create list of start dates for 10-day intervals
+var list_dates = ee.List.sequence(0, time_dif.subtract(1), 10)
+  .map(function(interval){
+    return time_start.advance(interval, 'day');
+  });
+
+// Helper function for 10-day composites
+function tenDayComposite(collection) {
+  // For each 10-day interval, calculate mean image
+  return ee.ImageCollection(list_dates.map(function(dates){
+    var start_date = ee.Date(dates);
+    var end_date = start_date.advance(10, 'day');
+    var composite = collection.filterDate(start_date, end_date).mean();
+    var bands = composite.bandNames().size();
+    // Keep only images with exactly 1 band (VV)
+    return composite
+      .set('system:time_start', start_date.millis())
+      .set('system:time_end', end_date.millis())
+      .set('band_number', bands);
+  })).filter(ee.Filter.eq('band_number', 1));
+}
+
+var asc_10days = tenDayComposite(asc); // 10-day composites for ascending orbits
+var des_10days = tenDayComposite(des); // 10-day composites for descending orbits
+
+// === Speckle Filtering (radius as variable) ===
+// ==============================================
+
+var speckle_radius = 30; // Radius for moving mean (in meters)
+
+function toSigma(image) {
+  // Convert from dB to linear (Sigma0), then apply moving mean
+  var sigma = ee.Image(10).pow(image.divide(10)).rename('sigma');
+  var speckle = sigma.focalMean(speckle_radius, 'square', 'meters');
+  return speckle.copyProperties(image, image.propertyNames());
+}
+
+var asc_sigma = asc_10days.map(toSigma); // Apply speckle filter to ascending composites
+var des_sigma = des_10days.map(toSigma); // Apply speckle filter to descending composites
+
+// === Mask Creation (Water & Urban combined) ===
+// ==============================================
+
+// Determine dominant land cover ("label") per pixel for the period
+var landcover_mode = dynamicWorld
+  .filterDate(time_start, time_end)
+  .filterBounds(geometry)
+  .select('label')
+  .mode();
+
+// Mask for non-water (label != 0)
+var water_mask = landcover_mode.neq(0); // 0 = water
+// Mask for non-urban (label != 6)
+var urban_mask = landcover_mode.neq(6); // 6 = urban
+// Combined mask (only pixels that are neither water nor urban)
+var mask = water_mask.and(urban_mask);
+
+// === Normalization & Soil Moisture Index ===
+// ===========================================
+
+// Calculate min/max values for normalization (over entire period)
+var asc_min = asc_sigma.min();
+var asc_max = asc_sigma.max();
+var des_min = des_sigma.min();
+var des_max = des_sigma.max();
+
+function normalizeAndMask(img, min, max, mask, name) {
+  // Normalize and apply mask
+  var denominator = max.subtract(min);
+  denominator = denominator.where(denominator.eq(0), 1); // Prevent division by zero
+  var index = img.subtract(min).divide(denominator);
+  var date = img.date().format('YYYY-MM-dd');
+  return index.multiply(mask).rename(name)
+    .copyProperties(img, ['system:time_start'])
+    .set('date', ee.String(date));
+}
+
+var asc_sm = asc_sigma.map(function(img){
+  return normalizeAndMask(img, asc_min, asc_max, mask, 'sm_asc');
+});
+
+var des_sm = des_sigma.map(function(img){
+  return normalizeAndMask(img, des_min, des_max, mask, 'sm_des');
+});
+
+// === Visualization & Charts ===
+// ==============================
+
+// Add soil moisture time series (ascending) as layer
+Map.addLayer(
+  asc_sm.filterDate('2023-10-01','2024-02-29').toBands().clip(geometry),
+  {},
+  'Soil Moisture Ascending',
+  false
+);
+
+// Add soil moisture time series (descending) as layer
+Map.addLayer(
+  des_sm.filterDate('2023-10-01','2024-02-29').toBands().clip(geometry),
+  {},
+  'Soil Moisture Descending',
+  false
+);
+
+print('Soil Moisture Ascending:', asc_sm);
+
+// Time series chart for soil moisture (ascending)
+print(
+  ui.Chart.image.series(asc_sm, geometry, ee.Reducer.mean(), 100, 'system:time_start')
+    .setOptions({title: 'Soil Moisture (Ascending)', vAxis: {title: 'Index'}})
+);
+
+// Time series chart for soil moisture (descending)
+print(
+  ui.Chart.image.series(des_sm, geometry, ee.Reducer.mean(), 100, 'system:time_start')
+    .setOptions({title: 'Soil Moisture (Descending)', vAxis: {title: 'Index'}})
+);
+
+// === Export ===
+// ==============
+
+// Export soil moisture time series (descending) as multiband image to Google Drive
+Export.image.toDrive({
+  image: des_sm.filterDate('2023-10-01','2024-02-29').toBands().clip(geometry),
+  description: 'SoilMoisture_Descending_2023-10_to_2024-02',
+  scale: 100,
+  region: geometry,
+  crs: 'EPSG:4326',
+  folder: 'test',
+  maxPixels: 1e13
+});
