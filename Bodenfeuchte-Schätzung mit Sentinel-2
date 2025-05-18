@@ -1,0 +1,269 @@
+var geometry = 
+    /* color: #d63000 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[7.379725307345084, 52.31173487029878],
+          [7.379725307345084, 52.19719395437755],
+          [7.568896144747428, 52.19719395437755],
+          [7.568896144747428, 52.31173487029878]]], null, false),
+    imageCollection = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED");
+
+// === IMPORTS & PARAMETERS ===
+var scaleAnalysis = 20;
+var startDate = '2023-01-01'; //change to '2024-01-01' for the second run
+var endDate = '2024-01-01'; //change to '2025-01-01' for the second run
+
+// Import Sentinel-2 Level-2A ImageCollection
+var imageCollection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+
+// === SENTINEL-2 FILTERING & TIME SERIES ===
+Map.centerObject(geometry);
+
+// Filter by AOI, date, and cloud coverage
+var sentinel = imageCollection
+  .filterBounds(geometry)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 56));
+
+// Function to create temporal (e.g. monthly) composites
+function temporal_collection(collection, start, count, interval, unit) {
+  var seq = ee.List.sequence(0, ee.Number(count).subtract(1));
+  var origin_date = ee.Date(start);
+  return ee.ImageCollection(seq.map(function(i) {
+    var start_date = origin_date.advance(ee.Number(interval).multiply(ee.Number(i)), unit);
+    var end_date = origin_date.advance(ee.Number(interval).multiply(ee.Number(i).add(1)), unit);
+    // Composite for each interval (e.g. month)
+    return collection.filterDate(start_date, end_date).median()
+      .set('system:time_start', start_date.millis())
+      .set('system:time_end', end_date.millis());
+  }));
+}
+
+// Create monthly composites for the selected period
+var monthly = temporal_collection(sentinel, startDate, 12, 1, 'month');
+
+// === INDEX CALCULATION ===
+var parameters = monthly.map(function(img){
+  var bands = img.select('B.*').multiply(0.0001);
+  var ndvi = bands.normalizedDifference(['B8','B4']).rename('ndvi');
+  var str = bands.expression('((1 - swir) ** 2)/(2 * swir)', {'swir': bands.select('B12')}).rename('str');
+  return ee.Image.cat([ndvi, str]).copyProperties(img, img.propertyNames());
+});
+
+// === NDVI MASKS ===
+// Mask for full vegetation cover (NDVI > 0.3)
+var str_full_cover = parameters.map(function(img){
+  var thr_full = img.select('ndvi').gt(0.3);
+  return img.select('str').updateMask(thr_full).copyProperties(img, img.propertyNames());
+});
+
+// Mask for bare land (0 < NDVI < 0.2)
+var str_bareland = parameters.map(function(img){
+  var thr_bare = img.select('ndvi').gt(0).and(img.select('ndvi').lt(0.2));
+  return img.select('str').updateMask(thr_bare).copyProperties(img, img.propertyNames());
+});
+
+// === SOIL MOISTURE STATISTICS ===
+// Helper function to get statistics from a collection
+function getStat(collection, reducer, scale) {
+  var reduced = collection.reduce(ee.Reducer[reducer]());
+  var values = reduced.reduceRegion({
+    reducer: ee.Reducer[reducer](),
+    geometry: geometry,
+    scale: scale,
+    bestEffort: true,
+    maxPixels: 1e8
+  }).values();
+  return ee.Number(values.get(0));
+}
+
+// Calculate various statistics for soil moisture estimation
+var vw = getStat(str_full_cover, 'max', 100);
+var vd = getStat(str_full_cover, 'min', 100);
+var iw = getStat(str_full_cover, 'max', 100);
+var id = getStat(str_full_cover, 'min', 100);
+
+var sw = vw.subtract(iw);
+var sd = vd.subtract(id);
+
+// === SOIL MOISTURE INDEX CALCULATION ===
+var sm = parameters.map(function(img){
+  var mask = img.select('ndvi').lt(-0.1).not();
+  // Soil moisture index formula (see reference)
+  var index = img.expression(
+    '(id + sd * ndvi - str) / (id - iw + (sd - sw) * ndvi)',
+    {'id': id, 'sd': sd, 'ndvi': img.select('ndvi'), 'str': img.select('str'), 'iw': iw, 'sw': sw}
+  ).rename('soil_moisture');
+  return index.multiply(1000).updateMask(mask)
+    .copyProperties(img, img.propertyNames());
+});
+
+// === TIME SERIES CHARTS ===
+// NDVI time series (mean over region)
+var ndviSeries = ui.Chart.image.series({
+  imageCollection: parameters.select('ndvi'),
+  region: geometry,
+  reducer: ee.Reducer.mean(),
+  scale: scaleAnalysis,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'NDVI Time Series (mean)',
+  vAxis: {title: 'NDVI'},
+  hAxis: {title: 'Date'},
+  lineWidth: 2,
+  pointSize: 4
+});
+print(ndviSeries);
+
+// Soil Moisture time series (mean over region)
+var smSeries = ui.Chart.image.series({
+  imageCollection: sm,
+  region: geometry,
+  reducer: ee.Reducer.mean(),
+  scale: scaleAnalysis,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Soil Moisture Time Series (mean)',
+  vAxis: {title: 'Soil Moisture'},
+  hAxis: {title: 'Date'},
+  lineWidth: 2,
+  pointSize: 4
+});
+print(smSeries);
+
+// Soil Moisture time series (first pixel in region)
+var smFirstSeries = ui.Chart.image.series({
+  imageCollection: sm,
+  region: geometry,
+  reducer: ee.Reducer.first(),
+  scale: scaleAnalysis,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Soil Moisture Time Series (first)',
+  vAxis: {title: 'Soil Moisture'},
+  hAxis: {title: 'Date'},
+  lineWidth: 2,
+  pointSize: 4
+});
+print(smFirstSeries);
+
+// === FEATURE STACK FOR CLASSIFICATION ===
+// Sentinel-2 mean image (for the period, cloud-masked)
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(geometry)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 15))
+  .mean()
+  .clip(geometry)
+  .select("B.*").multiply(0.0001)
+  .reproject('EPSG:4326', null, scaleAnalysis);
+
+// ESA WorldCover as reference data
+var refData = ee.ImageCollection('ESA/WorldCover/v200')
+  .first()
+  .reproject('EPSG:4326', null, scaleAnalysis)
+  .clip(geometry)
+  .select('Map');
+
+// Soil Moisture mean as additional feature (optional)
+var smMean = sm.mean().rename('soil_moisture');
+
+// Feature stack (includes S2, soil moisture, and reference)
+var data = ee.Image.cat(s2, smMean, refData);
+
+// === STRATIFIED SAMPLING ===
+// Draw stratified samples for classification (by reference map)
+var samples = data.select(data.bandNames()).stratifiedSample({
+  numPoints: 200,
+  classBand: 'Map',
+  region: geometry,
+  scale: scaleAnalysis,
+  geometries: true
+});
+
+// Training/validation split (random)
+var withRandom = samples.randomColumn('random');
+var split = 0.7; // 70% for training, 30% for validation
+var training = withRandom.filter(ee.Filter.lt('random', split));
+var validation = withRandom.filter(ee.Filter.gte('random', split));
+
+// === RFE: RECURSIVE FEATURE ELIMINATION ===
+var classifier = ee.Classifier.smileRandomForest(10);
+var bandNames = data.bandNames().remove('Map');
+var maxFeatures = 10; // Limit to 10 most important bands
+
+// Arrays to store accuracies and feature counts
+var trainAccuracies = [];
+var valAccuracies = [];
+var nFeaturesArr = [];
+
+// Client-side RFE workflow (practical for moderate number of features)
+var currentBands = bandNames.getInfo(); // Convert to JS array
+var nRemove = currentBands.length - maxFeatures;
+print('Starting RFE with', currentBands.length, 'features, removing', nRemove);
+
+for (var i = 0; i <= nRemove; i++) {
+  var trained = classifier.train(training, 'Map', currentBands);
+  // Training accuracy
+  var trainAccuracy = trained.confusionMatrix().accuracy().getInfo();
+  // Validation accuracy
+  var validated = validation.classify(trained);
+  var valAccuracy = validated.errorMatrix('Map', 'classification').accuracy().getInfo();
+  trainAccuracies.push(trainAccuracy);
+  valAccuracies.push(valAccuracy);
+  nFeaturesArr.push(currentBands.length);
+
+  // Only remove a feature if more remain
+  if (i < nRemove) {
+    var importance = ee.Dictionary(trained.explain().get('importance')).getInfo();
+    var minBand = null;
+    var minVal = null;
+    // Find the least important band
+    for (var key in importance) {
+      if (minVal === null || importance[key] < minVal) {
+        minVal = importance[key];
+        minBand = key;
+      }
+    }
+    currentBands = currentBands.filter(function(band) { return band !== minBand; });
+    print('Removed:', minBand, 'Remaining:', currentBands.length);
+  }
+}
+
+// === CHART: TRAINING/VALIDATION ACCURACY DURING RFE ===
+var chartData = nFeaturesArr.map(function(n, i) {
+  return {
+    nFeatures: n,
+    training: trainAccuracies[i],
+    validation: valAccuracies[i]
+  };
+});
+var fc = ee.FeatureCollection(chartData.map(function(d) {
+  return ee.Feature(null, d);
+}));
+var accuracyChart = ui.Chart.feature.byFeature(fc, 'nFeatures')
+  .setChartType('LineChart')
+  .setSeriesNames(['training', 'validation'])
+  .setOptions({
+    title: 'Training/Validation Accuracy during RFE',
+    hAxis: {title: 'Number of Features'},
+    vAxis: {title: 'Accuracy'},
+    lineWidth: 2,
+    pointSize: 4,
+    colors: ['red', 'green']
+  });
+print(accuracyChart);
+
+// === PRINT FINAL VALIDATION ACCURACY ===
+var finalValAccuracy = valAccuracies[valAccuracies.length - 1];
+print('Final validation accuracy:', finalValAccuracy);
+
+// === SOIL MOISTURE VISUALIZATION ===
+Map.addLayer(sm.toBands().clip(geometry), {}, 'Soil Moisture', false);
+Map.addLayer(s2, {bands: ["B8A","B4","B3"], gamma: 1, max: 0.500, min: 0.012, opacity: 1}, "Sentinel-2 Imagery", false);
+Map.addLayer(refData, {bands: ['Map']}, "ESA WorldCover V2", false);
